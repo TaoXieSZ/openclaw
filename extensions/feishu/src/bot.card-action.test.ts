@@ -397,3 +397,54 @@ describe("Feishu Card Action Handler", () => {
     vi.useRealTimers();
   });
 });
+
+describe("Card Update Flow", () => {
+  const cfg: ClawdbotConfig = {};
+  const runtime: RuntimeEnv = createRuntimeEnv();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetProcessedFeishuCardActionTokensForTests();
+  });
+
+  it("immediately updates card and dispatches for 'update' kind actions", async () => {
+    const event: FeishuCardActionEvent = {
+      operator: { open_id: "u123", user_id: "uid1", union_id: "un1" },
+      token: "tok_update_1",
+      action: {
+        value: createFeishuCardInteractionEnvelope({
+          k: "update",
+          a: "feishu.card.update.generate",
+          m: {
+            messageId: "msg_original_123",
+            prompt: "Generate a report",
+          },
+          c: { u: "u123", h: "chat1", t: "group", e: Date.now() + 60_000 },
+        }),
+        tag: "button",
+      },
+      context: { open_id: "u123", user_id: "uid1", chat_id: "chat1" },
+    };
+
+    await handleFeishuCardAction({ cfg, event, runtime, accountId: "main" });
+
+    // Should immediately update card to processing state
+    expect(sendCardFeishuMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        to: "chat:chat1",
+        card: expect.objectContaining({
+          header: expect.objectContaining({
+            title: expect.objectContaining({ content: "Processing..." }),
+          }),
+        }),
+        accountId: "main",
+      }),
+    );
+
+    // Should dispatch to agent with update context
+    expect(handleFeishuMessage).toHaveBeenCalled();
+    const dispatchCall = (handleFeishuMessage as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const messageContent = JSON.parse(dispatchCall.event.message.content);
+    expect(messageContent.text).toContain("updateId:");
+  });
+});
