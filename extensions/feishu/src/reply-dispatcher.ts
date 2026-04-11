@@ -1,22 +1,22 @@
+import { logTypingFailure } from "openclaw/plugin-sdk/channel-feedback";
+import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import {
   resolveSendableOutboundReplyParts,
   resolveTextChunksWithFallback,
   sendMediaWithLeadingCaption,
 } from "openclaw/plugin-sdk/reply-payload";
-import {
-  createChannelReplyPipeline,
-  createReplyPrefixContext,
-  logTypingFailure,
-  type ClawdbotConfig,
-  type OutboundIdentity,
-  type ReplyPayload,
-  type RuntimeEnv,
-} from "../runtime-api.js";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
 import { sendMediaFeishu } from "./media.js";
 import type { MentionTarget } from "./mention.js";
 import { buildMentionedCardContent } from "./mention.js";
+import {
+  createReplyPrefixContext,
+  type ClawdbotConfig,
+  type OutboundIdentity,
+  type ReplyPayload,
+  type RuntimeEnv,
+} from "./reply-dispatcher-runtime-api.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { sendMessageFeishu, sendStructuredCardFeishu, type CardHeaderConfig } from "./send.js";
 import { FeishuStreamingSession, mergeStreamingText } from "./streaming-card.js";
@@ -55,19 +55,35 @@ function resolveCardHeader(
   };
 }
 
-/** Build a card note footer from agent identity and model context. */
-function resolveCardNote(
-  agentId: string,
-  identity: OutboundIdentity | undefined,
-  prefixCtx: { model?: string; provider?: string },
-): string {
-  const name = identity?.name?.trim() || agentId;
-  const parts: string[] = [`Agent: ${name}`];
-  if (prefixCtx.model) {
-    parts.push(`Model: ${prefixCtx.model}`);
+/** Card footer note data enriched with session token usage. */
+type CardNoteContext = {
+  name: string;
+  model?: string;
+  provider?: string;
+  /** Estimated total tokens for this session turn */
+  totalTokens?: number | null;
+  /** Session context window size (max tokens) */
+  contextTokens?: number | null;
+};
+
+/** Format a card footer note. Shows Agent/Model/Provider/Tokens/Context in one line. */
+function formatCardNote(ctx: CardNoteContext): string {
+  const parts: string[] = [`Agent: ${ctx.name}`];
+  if (ctx.model) {
+    parts.push(`Model: ${ctx.model}`);
   }
-  if (prefixCtx.provider) {
-    parts.push(`Provider: ${prefixCtx.provider}`);
+  if (ctx.provider) {
+    parts.push(`Provider: ${ctx.provider}`);
+  }
+  if (ctx.totalTokens != null) {
+    const formatted = new Intl.NumberFormat("en-US").format(ctx.totalTokens);
+    if (ctx.contextTokens != null) {
+      parts.push(
+        `Tokens: ${formatted} / Context: ${new Intl.NumberFormat("en-US").format(ctx.contextTokens)}`,
+      );
+    } else {
+      parts.push(`Tokens: ${formatted}`);
+    }
   }
   return parts.join(" | ");
 }
@@ -77,6 +93,7 @@ export type CreateFeishuReplyDispatcherParams = {
   agentId: string;
   runtime: RuntimeEnv;
   chatId: string;
+  allowReasoningPreview?: boolean;
   replyToMessageId?: string;
   /** When true, preserve typing indicator on reply target but send messages without reply metadata */
   skipReplyToInMessages?: boolean;
@@ -90,6 +107,10 @@ export type CreateFeishuReplyDispatcherParams = {
   /** Epoch ms when the inbound message was created. Used to suppress typing
    *  indicators on old/replayed messages after context compaction (#30418). */
   messageCreateTimeMs?: number;
+  /** Session key used to query token usage after the run completes. */
+  sessionKey?: string;
+  /** Path to the session store, required for querying token usage. */
+  sessionStorePath?: string;
 };
 
 export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherParams) {
@@ -106,6 +127,8 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
     mentionTargets,
     accountId,
     identity,
+    sessionKey,
+    sessionStorePath,
   } = params;
   const sendReplyToMessageId = skipReplyToInMessages ? undefined : replyToMessageId;
   const threadReplyMode = threadReply === true;
@@ -188,6 +211,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   // Card streaming may miss thread affinity in topic contexts; use direct replies there.
   const streamingEnabled =
     !threadReplyMode && account.config?.streaming !== false && renderMode !== "raw";
+  const reasoningPreviewEnabled = streamingEnabled && params.allowReasoningPreview === true;
 
   let streaming: FeishuStreamingSession | null = null;
   let streamText = "";
@@ -199,7 +223,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   type StreamTextUpdateMode = "snapshot" | "delta";
 
   const formatReasoningPrefix = (thinking: string): string => {
-    if (!thinking) return "";
+    if (!thinking) {
+      return "";
+    }
     const withoutLabel = thinking.replace(/^Reasoning:\n/, "");
     const plain = withoutLabel.replace(/^_(.*)_$/gm, "$1");
     const lines = plain.split("\n").map((line) => `> ${line}`);
@@ -208,9 +234,15 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
   const buildCombinedStreamText = (thinking: string, answer: string): string => {
     const parts: string[] = [];
-    if (thinking) parts.push(formatReasoningPrefix(thinking));
-    if (thinking && answer) parts.push("\n\n---\n\n");
-    if (answer) parts.push(answer);
+    if (thinking) {
+      parts.push(formatReasoningPrefix(thinking));
+    }
+    if (thinking && answer) {
+      parts.push("\n\n---\n\n");
+    }
+    if (answer) {
+      parts.push(answer);
+    }
     return parts.join("");
   };
 
@@ -248,7 +280,9 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   };
 
   const queueReasoningUpdate = (nextThinking: string) => {
-    if (!nextThinking) return;
+    if (!nextThinking) {
+      return;
+    }
     reasoningText = nextThinking;
     flushStreamingCardUpdate(buildCombinedStreamText(reasoningText, streamText));
   };
@@ -271,13 +305,13 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       );
       try {
         const cardHeader = resolveCardHeader(agentId, identity);
-        const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
         await streaming.start(chatId, resolveReceiveIdType(chatId), {
           replyToMessageId,
           replyInThread: effectiveReplyInThread,
           rootId,
           header: cardHeader,
-          note: cardNote,
+          // Note will be updated in closeStreaming once token usage is available.
+          note: formatCardNote({ name: identity?.name?.trim() || agentId }),
         });
       } catch (error) {
         params.runtime.error?.(`feishu: streaming start failed: ${String(error)}`);
@@ -297,7 +331,30 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
       if (mentionTargets?.length) {
         text = buildMentionedCardContent(mentionTargets, text);
       }
-      const finalNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+      // Enrich footer with token usage from session store after run completes.
+      let finalNote = formatCardNote({
+        name: identity?.name?.trim() || agentId,
+        model: prefixContext.prefixContext.model,
+        provider: prefixContext.prefixContext.provider,
+      });
+      if (sessionKey && sessionStorePath) {
+        try {
+          const { loadSessionStore } = await import("openclaw/plugin-sdk/config-runtime");
+          const store = loadSessionStore(sessionStorePath, { skipCache: true });
+          const entry = store[sessionKey];
+          if (entry && entry.totalTokensFresh === true) {
+            finalNote = formatCardNote({
+              name: identity?.name?.trim() || agentId,
+              model: prefixContext.prefixContext.model,
+              provider: prefixContext.prefixContext.provider,
+              totalTokens: entry.totalTokens ?? null,
+              contextTokens: entry.contextTokens ?? null,
+            });
+          }
+        } catch {
+          // Non-fatal: fall back to basic note.
+        }
+      }
       await streaming.close(text, { note: finalNote });
     }
     streaming = null;
@@ -415,7 +472,11 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
 
           if (useCard) {
             const cardHeader = resolveCardHeader(agentId, identity);
-            const cardNote = resolveCardNote(agentId, identity, prefixContext.prefixContext);
+            const cardNote = formatCardNote({
+              name: identity?.name?.trim() || agentId,
+              model: prefixContext.prefixContext.model,
+              provider: prefixContext.prefixContext.provider,
+            });
             await sendChunkedTextReply({
               text,
               useCard: true,
@@ -491,7 +552,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             });
           }
         : undefined,
-      onReasoningStream: streamingEnabled
+      onReasoningStream: reasoningPreviewEnabled
         ? (payload: ReplyPayload) => {
             if (!payload.text) {
               return;
@@ -500,7 +561,7 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
             queueReasoningUpdate(payload.text);
           }
         : undefined,
-      onReasoningEnd: streamingEnabled ? () => {} : undefined,
+      onReasoningEnd: reasoningPreviewEnabled ? () => {} : undefined,
     },
     markDispatchIdle,
   };

@@ -1,12 +1,33 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   loadConfigMock as loadConfig,
+  resolveConfigPathMock as resolveConfigPath,
   resolveGatewayPortMock as resolveGatewayPort,
+  resolveStateDirMock as resolveStateDir,
 } from "../gateway/gateway-connection.test-mocks.js";
 import { captureEnv, withEnvAsync } from "../test-utils/env.js";
+
+vi.mock("../config/config.js", async () => {
+  const mocks = await import("../gateway/gateway-connection.test-mocks.js");
+  return {
+    loadConfig: mocks.loadConfigMock,
+    resolveConfigPath: mocks.resolveConfigPathMock,
+    resolveGatewayPort: mocks.resolveGatewayPortMock,
+    resolveStateDir: mocks.resolveStateDirMock,
+  };
+});
+
+vi.mock("../gateway/net.js", async () => {
+  const mocks = await import("../gateway/gateway-connection.test-mocks.js");
+  return {
+    isLoopbackHost: mocks.isLoopbackHostMock,
+    isSecureWebSocketUrl: mocks.isSecureWebSocketUrlMock,
+    pickPrimaryLanIPv4: mocks.pickPrimaryLanIPv4Mock,
+  };
+});
 
 const { GatewayChatClient, resolveGatewayConnection } = await import("./gateway-chat.js");
 
@@ -91,7 +112,16 @@ describe("resolveGatewayConnection", () => {
     ]);
     loadConfig.mockReset();
     resolveGatewayPort.mockReset();
+    resolveStateDir.mockReset();
+    resolveConfigPath.mockReset();
     resolveGatewayPort.mockReturnValue(18789);
+    resolveStateDir.mockImplementation(
+      (env: NodeJS.ProcessEnv) => env.OPENCLAW_STATE_DIR ?? "/tmp/openclaw",
+    );
+    resolveConfigPath.mockImplementation(
+      (env: NodeJS.ProcessEnv, stateDir: string) =>
+        env.OPENCLAW_CONFIG_PATH ?? `${stateDir}/openclaw.json`,
+    );
     delete process.env.OPENCLAW_GATEWAY_URL;
     delete process.env.OPENCLAW_GATEWAY_TOKEN;
     delete process.env.OPENCLAW_GATEWAY_PASSWORD;
