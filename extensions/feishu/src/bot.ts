@@ -1015,6 +1015,10 @@ export async function handleFeishuMessage(params: {
             accountId: account.accountId,
             identity,
             messageCreateTimeMs,
+            sessionKey: agentSessionKey,
+            sessionStorePath: core.channel.session.resolveStorePath(cfg.session?.store, {
+              agentId,
+            }),
           });
 
           log(
@@ -1117,6 +1121,10 @@ export async function handleFeishuMessage(params: {
         accountId: account.accountId,
         identity,
         messageCreateTimeMs,
+        sessionKey: route.sessionKey,
+        sessionStorePath: core.channel.session.resolveStorePath(cfg.session?.store, {
+          agentId: route.agentId,
+        }),
       });
 
       log(`feishu[${account.accountId}]: dispatching to agent (session=${route.sessionKey})`);
